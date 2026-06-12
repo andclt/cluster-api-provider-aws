@@ -242,6 +242,22 @@ func (mr *MockOCMClientMockRecorder) GetControlPlaneUpgradePolicies(arg0 interfa
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetControlPlaneUpgradePolicies", reflect.TypeOf((*MockOCMClient)(nil).GetControlPlaneUpgradePolicies), arg0)
 }
 
+// GetCurrentOrganization mocks base method.
+func (m *MockOCMClient) GetCurrentOrganization() (string, string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCurrentOrganization")
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(string)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// GetCurrentOrganization indicates an expected call of GetCurrentOrganization.
+func (mr *MockOCMClientMockRecorder) GetCurrentOrganization() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCurrentOrganization", reflect.TypeOf((*MockOCMClient)(nil).GetCurrentOrganization))
+}
+
 // GetHTPasswdUserList mocks base method.
 func (m *MockOCMClient) GetHTPasswdUserList(arg0, arg1 string) (*v1.HTPasswdUserList, error) {
 	m.ctrl.T.Helper()
