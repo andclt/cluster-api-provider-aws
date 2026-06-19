@@ -20,16 +20,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"strings"
+	"time"
 
 	"github.com/openshift/rosa/pkg/aws"
 	rosalogging "github.com/openshift/rosa/pkg/logging"
 	"github.com/openshift/rosa/pkg/reporter"
 	rosacli "github.com/openshift/rosa/pkg/rosa"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -42,6 +46,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-aws/v2/pkg/logger"
 	caparosa "sigs.k8s.io/cluster-api-provider-aws/v2/pkg/rosa"
 	"sigs.k8s.io/cluster-api-provider-aws/v2/pkg/rosa/ocmrole"
+	"sigs.k8s.io/cluster-api-provider-aws/v2/util/system"
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -56,9 +61,6 @@ type ROSAOCMRoleConfigReconciler struct {
 	NewOCMClient     func(ctx context.Context, scope caparosa.OCMSecretsRetriever) (caparosa.OCMClient, error)
 	// runtimeFactory overrides runtime creation per reconciliation. Used in tests to inject mock clients.
 	runtimeFactory func(ctx context.Context, scope *scope.ROSAOCMRoleConfigScope) (*rosacli.Runtime, error)
-
-	// Per-organization linking mutex
-	orgLinkMutexes sync.Map // map[orgID]*sync.Mutex
 }
 
 func (r *ROSAOCMRoleConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
@@ -77,6 +79,7 @@ func (r *ROSAOCMRoleConfigReconciler) SetupWithManager(ctx context.Context, mgr 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=rosaocmroleconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=rosaocmroleconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=rosaocmroleconfigs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update;delete
 
 // Reconcile reconciles ROSAOCMRoleConfig.
 func (r *ROSAOCMRoleConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, reterr error) {
@@ -120,11 +123,11 @@ func (r *ROSAOCMRoleConfigReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if !scope.ROSAOCMRoleConfig.DeletionTimestamp.IsZero() {
 		scope.Info("Deleting ROSAOCMRoleConfig.")
 		v1beta1conditions.MarkFalse(scope.ROSAOCMRoleConfig, expinfrav1.ROSAOCMRoleConfigReadyCondition, expinfrav1.ROSAOCMRoleConfigDeletionStarted, clusterv1beta1.ConditionSeverityInfo, "Deletion of ROSAOCMRoleConfig started")
-		err = r.reconcileDelete(ctx, scope, rt)
-		if err == nil {
+		result, err := r.reconcileDelete(ctx, scope, rt)
+		if err == nil && result.RequeueAfter == 0 {
 			controllerutil.RemoveFinalizer(scope.ROSAOCMRoleConfig, expinfrav1.ROSAOCMRoleConfigFinalizer)
 		}
-		return ctrl.Result{}, err
+		return result, err
 	}
 
 	if controllerutil.AddFinalizer(scope.ROSAOCMRoleConfig, expinfrav1.ROSAOCMRoleConfigFinalizer) {
@@ -134,7 +137,7 @@ func (r *ROSAOCMRoleConfigReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	return r.reconcileOCMRole(ctx, scope, rt)
 }
 
-func (r *ROSAOCMRoleConfigReconciler) reconcileOCMRole(_ context.Context, scope *scope.ROSAOCMRoleConfigScope, rt *rosacli.Runtime) (ctrl.Result, error) {
+func (r *ROSAOCMRoleConfigReconciler) reconcileOCMRole(ctx context.Context, scope *scope.ROSAOCMRoleConfigScope, rt *rosacli.Runtime) (ctrl.Result, error) {
 	ocmRoleConfig := scope.ROSAOCMRoleConfig
 
 	// Convert profile from CRD enum to extracted code enum
@@ -173,12 +176,18 @@ func (r *ROSAOCMRoleConfigReconciler) reconcileOCMRole(_ context.Context, scope 
 	ocmRoleConfig.Status.RoleARN = roleARN
 	ocmRoleConfig.Status.OrganizationID = orgID
 
-	// Acquire per-organization mutex to prevent concurrent LinkOrgToRole races.
+	// Acquire per-organization lease to prevent concurrent LinkOrgToRole races.
 	// Multiple ROSAOCMRoleConfigs with different AWS accounts can link to the same org,
 	// causing read-modify-write races on the org label. Serialize linking per org.
-	linkMu := r.getLinkMutex(orgID)
-	linkMu.Lock()
-	defer linkMu.Unlock()
+	holderIdentity := ocmRoleConfig.Name
+	lease, err := r.acquireOrgLease(ctx, orgID, holderIdentity)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if lease == nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	defer r.releaseOrgLease(ctx, lease)
 
 	// Check if role is linked to organization
 	existsOnOCM, _, linkedARN, err := rt.OCMClient.CheckIfAWSAccountExists(orgID, rt.Creator.AccountID)
@@ -227,7 +236,7 @@ func (r *ROSAOCMRoleConfigReconciler) reconcileOCMRole(_ context.Context, scope 
 	return ctrl.Result{}, nil
 }
 
-func (r *ROSAOCMRoleConfigReconciler) reconcileDelete(_ context.Context, scope *scope.ROSAOCMRoleConfigScope, rt *rosacli.Runtime) error {
+func (r *ROSAOCMRoleConfigReconciler) reconcileDelete(ctx context.Context, scope *scope.ROSAOCMRoleConfigScope, rt *rosacli.Runtime) (ctrl.Result, error) {
 	ocmRoleConfig := scope.ROSAOCMRoleConfig
 
 	// Check deletion policy
@@ -238,44 +247,50 @@ func (r *ROSAOCMRoleConfigReconciler) reconcileDelete(_ context.Context, scope *
 
 	if deletionPolicy == expinfrav1.ROSAOCMRoleDeletionPolicyRetain {
 		scope.Info("DeletionPolicy is Retain, skipping OCM role deletion")
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	orgID := ocmRoleConfig.Status.OrganizationID
 	if orgID == "" {
 		scope.Info("No organization ID in status, skipping cleanup")
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	roleARN := ocmRoleConfig.Status.RoleARN
 	if roleARN == "" {
 		scope.Info("No role ARN in status, skipping cleanup")
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	roleName, err := aws.GetResourceIdFromARN(roleARN)
 	if err != nil {
-		return fmt.Errorf("failed to parse role ARN: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to parse role ARN: %w", err)
 	}
 
-	// Acquire per-organization mutex to prevent concurrent unlink/link races.
+	// Acquire per-organization lease to prevent concurrent unlink/link races.
 	// Multiple ROSAOCMRoleConfigs with different AWS accounts can link to the same org,
 	// and we need to prevent a race where one CR is unlinking while another is linking.
-	linkMu := r.getLinkMutex(orgID)
-	linkMu.Lock()
+	holderIdentity := scope.ROSAOCMRoleConfig.Name
+	lease, err := r.acquireOrgLease(ctx, orgID, holderIdentity)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if lease == nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 
 	// CheckIfAWSAccountExists returns the actual linked ARN for this AWS account in this org
 	existsOnOCM, _, linkedARN, err := rt.OCMClient.CheckIfAWSAccountExists(orgID, rt.Creator.AccountID)
 	if err != nil {
-		linkMu.Unlock()
-		return fmt.Errorf("failed to check AWS account link status: %w", err)
+		r.releaseOrgLease(ctx, lease)
+		return ctrl.Result{}, fmt.Errorf("failed to check AWS account link status: %w", err)
 	}
 
 	if existsOnOCM && linkedARN == roleARN {
 		err := rt.OCMClient.UnlinkOCMRoleFromOrg(orgID, roleARN)
 		if err != nil {
-			linkMu.Unlock()
-			return fmt.Errorf("failed to unlink the role: %w", err)
+			r.releaseOrgLease(ctx, lease)
+			return ctrl.Result{}, fmt.Errorf("failed to unlink the role: %w", err)
 		}
 		scope.Info("Successfully unlinked role", "roleARN", roleARN, "orgID", orgID)
 	} else if existsOnOCM && linkedARN != roleARN {
@@ -284,26 +299,25 @@ func (r *ROSAOCMRoleConfigReconciler) reconcileDelete(_ context.Context, scope *
 		scope.Info("No role linked in OCM for this AWS account, skipping unlink", "roleARN", roleARN, "orgID", orgID)
 	}
 
-	// Release mutex - OCM operations are complete
-	linkMu.Unlock()
+	r.releaseOrgLease(ctx, lease)
 
 	// Delete IAM role
 	roleExists, _, err := rt.AWSClient.CheckRoleExists(roleName)
 	if err != nil {
-		return fmt.Errorf("failed to check role existence: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to check role existence: %w", err)
 	}
 
 	if roleExists {
 		err = rt.AWSClient.DeleteOCMRole(roleName, false)
 		if err != nil {
-			return fmt.Errorf("failed to delete IAM role: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to delete IAM role: %w", err)
 		}
 		scope.Info("Successfully deleted OCM role", "roleName", roleName)
 	} else {
 		scope.Info("IAM role does not exist, skipping deletion", "roleName", roleName)
 	}
 
-	return nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ROSAOCMRoleConfigReconciler) convertProfile(profile expinfrav1.ROSAOCMRoleProfile) (ocmrole.RoleProfile, error) {
@@ -319,9 +333,77 @@ func (r *ROSAOCMRoleConfigReconciler) convertProfile(profile expinfrav1.ROSAOCMR
 	}
 }
 
-func (r *ROSAOCMRoleConfigReconciler) getLinkMutex(orgID string) *sync.Mutex {
-	mu, _ := r.orgLinkMutexes.LoadOrStore(orgID, &sync.Mutex{})
-	return mu.(*sync.Mutex)
+const leaseDurationSeconds int32 = 15
+
+func (r *ROSAOCMRoleConfigReconciler) acquireOrgLease(ctx context.Context, orgID string, holderIdentity string) (*coordinationv1.Lease, error) {
+	leaseName := fmt.Sprintf("ocm-org-%s", strings.ToLower(orgID))
+	namespace := system.GetManagerNamespace()
+
+	for {
+		lease := &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      leaseName,
+				Namespace: namespace,
+			},
+		}
+
+		now := metav1.NewMicroTime(time.Now())
+		err := r.Client.Get(ctx, client.ObjectKeyFromObject(lease), lease)
+
+		if apierrors.IsNotFound(err) {
+			lease.Spec = coordinationv1.LeaseSpec{
+				HolderIdentity:       ptr.To(holderIdentity),
+				LeaseDurationSeconds: ptr.To(leaseDurationSeconds),
+				AcquireTime:          &now,
+				RenewTime:            &now,
+			}
+			if err := r.Client.Create(ctx, lease); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					continue
+				}
+				return nil, err
+			}
+			return lease, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != "" && *lease.Spec.HolderIdentity != holderIdentity {
+			if lease.Spec.RenewTime != nil {
+				expiry := lease.Spec.RenewTime.Time.Add(time.Duration(leaseDurationSeconds) * time.Second)
+				if time.Now().Before(expiry) {
+					return nil, nil
+				}
+			}
+		}
+
+		// Track lease transitions for observability
+		holderChanged := lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holderIdentity
+		if holderChanged && lease.Spec.LeaseTransitions != nil {
+			lease.Spec.LeaseTransitions = ptr.To(*lease.Spec.LeaseTransitions + 1)
+		}
+
+		lease.Spec.HolderIdentity = ptr.To(holderIdentity)
+		lease.Spec.RenewTime = &now
+		if err := r.Client.Update(ctx, lease); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return nil, err
+		}
+		return lease, nil
+	}
+}
+
+func (r *ROSAOCMRoleConfigReconciler) releaseOrgLease(ctx context.Context, lease *coordinationv1.Lease) {
+	if lease == nil {
+		return
+	}
+
+	// Clear holder identity instead of deleting the lease
+	lease.Spec.HolderIdentity = ptr.To("")
+	_ = r.Client.Update(ctx, lease)
 }
 
 // setUpRuntime creates a ROSA runtime for the current reconciliation using the scope's AWS session.

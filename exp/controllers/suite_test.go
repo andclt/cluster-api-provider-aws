@@ -66,6 +66,13 @@ func setup() {
 	if err != nil {
 		panic(err)
 	}
+
+	// Create capa-system namespace for lease tests
+	capaSystemNs := &corev1.Namespace{}
+	capaSystemNs.Name = "capa-system"
+	if err := testEnv.Create(ctx, capaSystemNs); err != nil {
+		panic(fmt.Sprintf("Failed to create capa-system namespace: %v", err))
+	}
 	if err := (&capawebhooks.AWSCluster{}).SetupWebhookWithManager(testEnv); err != nil {
 		panic(fmt.Sprintf("Unable to setup AWSCluster webhook: %v", err))
 	}
